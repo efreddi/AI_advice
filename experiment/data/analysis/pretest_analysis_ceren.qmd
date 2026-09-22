@@ -1,0 +1,637 @@
+---
+title: "AI Advice – Pretest Analysis"
+subtitle: "Evaluation of AI justifications"
+author: "Ceren Ay"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    df-print: kable
+execute:
+  warning: false
+  message: false
+params:
+  data_dir: "../pretest"          
+  exclude_failed_checks: true     
+  speeder_cutoff: 0.33           
+  exclude_speeders: false         
+  save_outputs: true              
+---
+
+## About this document
+
+NOTE: Used Claude Cowork a bit in this file to organize the results and visualize better(can be discussed how well it worked).
+
+This file analyses the **pretest** of the AI-advice experiment. After reading the
+allocation task (dictator game with a taking option: decision-maker has £10,
+recipient has £4), participants saw three AI responses that all recommend
+*"give £3 to the recipient"* but differ in the **evaluative standard** and
+justification:
+
+| Condition | Evaluative standard | Justification (short) |
+|---|---|---|
+| `equal` | Equality | Both end up with £7; upholds the principle of equality |
+| `fair` | Fairness | Both end up with £7; aligns with the principle of fairness |
+| `fairequal` | Fairness and Equality | Both end up with £7; promotes fairness and equality |
+
+Each response was rated (within subjects, block order randomised by Qualtrics) on
+three 5-point Likert items (1 = Strongly disagree … 5 = Strongly agree):
+
+1. **Standard matters** – "The recommendation is based on a standard that matters to me"
+2. **Reasoning makes sense** – "The reasoning behind this recommendation makes sense to me"
+3. **Inclined to revise** – "After reading this response, I feel more inclined to revise my allocation decision"
+
+
+```{r}
+#| label: setup
+#| code-fold: false
+
+required <- c("tidyverse", "lme4", "lmerTest", "emmeans", "ordinal", "knitr")
+missing  <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Please install: ", paste(missing, collapse = ", "),
+                          "\n  install.packages(c(\"", paste(missing, collapse = "\", \""), "\"))")
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lme4)
+  library(lmerTest)
+  library(emmeans)
+  library(knitr)
+})
+
+# ---- Labels (edit here if conditions/items change) -------------------------
+advice_labels <- c(
+  equal     = "Equality",
+  fair      = "Fairness",
+  fairequal = "Fairness & Equality"
+)
+item_labels <- c(
+  "1" = "Standard matters",
+  "2" = "Reasoning makes sense",
+  "3" = "Inclined to revise"
+)
+likert_levels <- c("Strongly disagree", "Somewhat disagree",
+                   "Neither agree nor disagree", "Somewhat agree", "Strongly agree")
+
+# Qualtrics block IDs of the randomised advice blocks (used only if the
+# randomisation order is exported, see the "Order effects" section)
+block_to_advice <- c(
+  "BL_3Vona5LNo1cvl0q" = "equal",     "AI advice 1" = "equal",
+  "BL_7QbYfICheXo8su2" = "fair",      "AI advice 2" = "fair",
+  "BL_3xC1DEX1CbvBK62" = "fairequal", "AI advice 3" = "fairequal"
+)
+
+# Correct answers of the comprehension checks (amount in £)
+correct_q5 <- 4   # Q5: most you can take
+correct_q6 <- 0   # Q6: least you can give
+
+# ---- Plot style -------------------------------------------------------------
+pal_advice <- c("#2a78d6", "#eb6834", "#1baf7a")          # fixed categorical order
+pal_likert <- c("#c73a39", "#f0a19e", "#cfcdc8", "#8db6ea", "#2a78d6")  # diverging, gray midpoint
+names(pal_likert) <- likert_levels
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.y = element_line(colour = "grey90", linewidth = 0.3),
+          panel.grid.major.x = element_blank(),
+          strip.text = element_text(face = "bold", hjust = 0),
+          legend.position = "bottom",
+          plot.title.position = "plot")
+)
+
+if (params$save_outputs) dir.create("output", showWarnings = FALSE)
+```
+
+## Data import
+
+```{r}
+#| label: import
+
+read_qualtrics <- function(path) {
+  hdr <- names(read_csv(path, n_max = 0, show_col_types = FALSE))
+  dat <- read_csv(path, col_names = hdr, skip = 1, col_types = cols(.default = "c"),
+                  show_col_types = FALSE)
+  # Drop Qualtrics' extra header rows (question text + ImportId rows)
+  dat <- dat |>
+    filter(!(StartDate %in% c("Start Date", "StartDate")),
+           !str_detect(StartDate, fixed("ImportId")))
+  # Clean names: Qualtrics adds spaces, e.g. "advice_equal _1" -> "advice_equal_1"
+  names(dat) <- str_replace_all(names(dat), "\\s+", "")
+  dat |> mutate(source_file = basename(path))
+}
+
+files <- list.files(params$data_dir, pattern = "\\.csv$", full.names = TRUE)
+if (length(files) == 0) stop("No CSV files found in ", params$data_dir)
+
+raw <- map(files, read_qualtrics) |>
+  list_rbind() |>
+  distinct(ResponseId, .keep_all = TRUE) |>
+  mutate(Duration = as.numeric(`Duration(inseconds)`),
+         Progress = as.numeric(Progress),
+         Finished = as.logical(toupper(Finished)),
+         StartDate = ymd_hms(StartDate, quiet = TRUE))
+
+tibble(file = basename(files)) |> kable(col.names = "Files read")
+cat("Rows read (after de-duplication):", nrow(raw), "\n")
+```
+
+## Sample and exclusions
+
+Responses are excluded step by step: survey previews / tests, incomplete
+responses, failed comprehension checks (if `exclude_failed_checks = TRUE`),
+missing advice ratings, and speeders (if `exclude_speeders = TRUE`). Duplicate IP
+addresses are flagged.
+
+```{r}
+#| label: exclusions
+
+check_amount <- function(x) {
+  x <- str_trim(x)
+  case_when(x == "1" ~ 0, x == "2" ~ 4, x == "3" ~ 10,
+            TRUE ~ suppressWarnings(as.numeric(str_extract(x, "\\d+"))))
+}
+
+advice_cols <- str_subset(names(raw), "^advice_.+_\\d+$")
+
+d <- raw |>
+  mutate(
+    is_preview   = Status %in% c("Survey Preview", "1", "Survey Test", "2") |
+                   DistributionChannel %in% c("preview", "test"),
+    check_take   = check_amount(Q5) == correct_q5,
+    check_give   = check_amount(Q6) == correct_q6,
+    checks_pass  = coalesce(check_take & check_give, FALSE),
+    has_ratings  = rowSums(!is.na(across(all_of(advice_cols)))) == length(advice_cols),
+    dup_ip       = !is.na(IPAddress) & (duplicated(IPAddress) | duplicated(IPAddress, fromLast = TRUE))
+  )
+
+med_dur <- median(d$Duration[!d$is_preview & d$Finished], na.rm = TRUE)
+d <- d |> mutate(speeder = Duration < params$speeder_cutoff * med_dur)
+
+steps <- list(
+  "All recorded responses"                 = rep(TRUE, nrow(d)),
+  "Not a preview/test"                     = !d$is_preview,
+  "Finished"                               = d$Finished,
+  "Passed comprehension checks"            = if (params$exclude_failed_checks) d$checks_pass else rep(TRUE, nrow(d)),
+  "All advice ratings present"             = d$has_ratings,
+  "Not a speeder"                          = if (params$exclude_speeders) !d$speeder else rep(TRUE, nrow(d))
+)
+keep <- Reduce(`&`, steps, accumulate = TRUE)
+tibble(step = names(steps),
+       n_remaining = map_int(keep, sum),
+       excluded = c(0, -diff(map_int(keep, sum)))) |>
+  kable(col.names = c("Step", "N remaining", "Excluded at this step"))
+
+d_clean <- d[keep[[length(keep)]], ]
+N <- nrow(d_clean)
+```
+
+**Analysis sample: N = `r N`.**
+
+```{r}
+#| label: sample-quality
+
+d_real <- d |> filter(!is_preview, Finished)
+tibble(
+  Indicator = c("Comprehension check 1 (take £4) correct",
+                "Comprehension check 2 (give £0) correct",
+                "Both checks correct",
+                sprintf("Speeders (< %.0f%% of median duration = %.0f s)",
+                        100 * params$speeder_cutoff, params$speeder_cutoff * med_dur),
+                "Duplicate IP address"),
+  n = c(sum(d_real$check_take, na.rm = TRUE), sum(d_real$check_give, na.rm = TRUE),
+        sum(d_real$checks_pass), sum(d_real$speeder, na.rm = TRUE), sum(d_real$dup_ip)),
+  pct = round(100 * n / nrow(d_real), 1)
+) |> kable(col.names = c("Indicator (non-preview, finished)", "n", "%"))
+
+att <- d_clean |> select(any_of(c("attempts_take", "attempts_give")))
+if (ncol(att) && any(!is.na(att))) {
+  att |> mutate(across(everything(), as.numeric)) |>
+    pivot_longer(everything()) |> count(name, value) |> kable()
+} else {
+  cat("Note: embedded data 'attempts_take' / 'attempts_give' are empty in this export.\n")
+}
+```
+
+```{r}
+#| label: fig-duration
+#| fig-cap: "Completion time (analysis sample). Dashed line = median."
+#| fig-height: 3
+
+ggplot(d_clean, aes(Duration / 60)) +
+  geom_histogram(binwidth = 0.5, boundary = 0, fill = pal_advice[1], colour = "white") +
+  geom_vline(xintercept = median(d_clean$Duration) / 60, linetype = "dashed") +
+  labs(x = "Minutes", y = "Participants")
+
+summary(d_clean$Duration / 60) |> round(2)
+```
+
+## Reshaping to long format
+
+```{r}
+#| label: long
+
+to_score <- function(x) {
+  x <- str_trim(x)
+  num <- suppressWarnings(as.numeric(x))
+  ifelse(!is.na(num), num, match(tolower(x), tolower(likert_levels)))
+}
+
+long <- d_clean |>
+  select(ResponseId, all_of(advice_cols)) |>
+  pivot_longer(-ResponseId, names_to = "var", values_to = "response") |>
+  mutate(
+    advice_code = str_match(var, "^advice_(.+)_(\\d+)$")[, 2],
+    item_code   = str_match(var, "^advice_(.+)_(\\d+)$")[, 3],
+    score       = to_score(response),
+    advice = coalesce(advice_labels[advice_code], str_to_title(advice_code)),
+    advice = factor(advice, levels = unique(c(advice_labels, sort(unique(advice))))),
+    advice = droplevels(advice),
+    item   = factor(coalesce(item_labels[item_code], paste("Item", item_code)),
+                    levels = unique(c(item_labels, paste("Item", sort(unique(item_code)))))),
+    item   = droplevels(item),
+    response_lbl = factor(likert_levels[score], levels = likert_levels),
+    id = factor(ResponseId)
+  )
+
+if (any(is.na(long$score))) warning("Some Likert responses could not be converted to numbers.")
+pal_adv <- setNames(rep_len(pal_advice, nlevels(long$advice)), levels(long$advice))
+
+head(long |> select(ResponseId, advice, item, response, score), 6)
+```
+
+## Descriptive statistics
+
+```{r}
+#| label: tbl-desc
+#| tbl-cap: "Ratings by advice and item (1 = Strongly disagree, 5 = Strongly agree). % agree = Somewhat/Strongly agree; % disagree = Somewhat/Strongly disagree."
+
+desc <- long |>
+  group_by(item, advice) |>
+  summarise(n = sum(!is.na(score)),
+            mean = mean(score, na.rm = TRUE),
+            sd = sd(score, na.rm = TRUE),
+            median = median(score, na.rm = TRUE),
+            pct_agree = 100 * mean(score >= 4, na.rm = TRUE),
+            pct_disagree = 100 * mean(score <= 2, na.rm = TRUE),
+            .groups = "drop")
+desc |> kable(digits = c(0, 0, 0, 2, 2, 1, 1, 1),
+              col.names = c("Item", "Advice", "n", "Mean", "SD", "Median", "% agree", "% disagree"))
+```
+
+```{r}
+#| label: fig-likert
+#| fig-cap: "Distribution of responses. Bars are centred on the neutral category: disagreement to the left, agreement to the right."
+#| fig-height: 5.5
+#| fig-width: 9
+
+lik <- long |>
+  count(item, advice, response_lbl, .drop = FALSE) |>
+  group_by(item, advice) |>
+  mutate(pct = 100 * n / sum(n)) |>
+  ungroup() |>
+  mutate(pct_plot = case_when(
+    as.integer(response_lbl) < 3  ~ -pct,
+    as.integer(response_lbl) == 3 ~ -pct / 2,
+    TRUE ~ pct))
+neutral_right <- lik |> filter(as.integer(response_lbl) == 3) |> mutate(pct_plot = pct / 2)
+lik_plot <- bind_rows(lik, neutral_right)
+
+ggplot(lik_plot, aes(x = pct_plot, y = fct_rev(advice), fill = response_lbl)) +
+  geom_col(data = filter(lik_plot, pct_plot < 0),
+           position = position_stack(reverse = FALSE), width = 0.7, colour = "white", linewidth = 0.4) +
+  geom_col(data = filter(lik_plot, pct_plot >= 0),
+           position = position_stack(reverse = TRUE), width = 0.7, colour = "white", linewidth = 0.4) +
+  geom_vline(xintercept = 0, colour = "grey40", linewidth = 0.3) +
+  facet_wrap(~ item, ncol = 1) +
+  scale_fill_manual(values = pal_likert, drop = FALSE, name = NULL,
+                    breaks = likert_levels) +
+  scale_x_continuous(labels = \(x) paste0(abs(x), "%"), limits = c(-100, 100)) +
+  labs(x = NULL, y = NULL) +
+  guides(fill = guide_legend(nrow = 1)) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_line(colour = "grey90", linewidth = 0.3))
+```
+
+```{r}
+#| label: fig-means
+#| fig-cap: "Mean ratings with 95% within-subject confidence intervals (Cousineau–Morey). Small grey points are individual participants."
+#| fig-height: 4
+#| fig-width: 9
+
+# Cousineau-Morey within-subject CI
+k <- nlevels(long$advice)
+ws <- long |>
+  group_by(item, id) |> mutate(pmean = mean(score)) |>
+  group_by(item) |> mutate(norm = score - pmean + mean(score)) |>
+  group_by(item, advice) |>
+  summarise(mean = mean(score), n = n(),
+            se = sd(norm) / sqrt(n) * sqrt(k / (k - 1)),
+            .groups = "drop") |>
+  mutate(ci = qt(.975, n - 1) * se)
+
+ggplot(ws, aes(advice, mean, colour = advice)) +
+  geom_jitter(data = long, aes(y = score), width = 0.15, height = 0.12,
+              colour = "grey75", size = 1, alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean - ci, ymax = mean + ci), width = 0.12, linewidth = 0.7) +
+  geom_point(size = 3) +
+  facet_wrap(~ item) +
+  scale_colour_manual(values = pal_adv, guide = "none") +
+  scale_y_continuous(breaks = 1:5, limits = c(0.8, 5.2),
+                     labels = c("1\nStr. disagree", "2", "3\nNeutral", "4", "5\nStr. agree")) +
+  scale_x_discrete(labels = scales::label_wrap(10)) +
+  labs(x = NULL, y = "Rating")
+```
+
+## Do ratings differ between the advice versions?
+
+The primary tests are non-parametric (ordinal 5-point items); the mixed models
+are reported as robustness checks.
+
+### Friedman tests (omnibus, per item)
+
+
+```{r}
+#| label: tbl-friedman
+
+wide_item <- function(it) {
+  long |> filter(item == it) |>
+    select(id, advice, score) |>
+    pivot_wider(names_from = advice, values_from = score) |>
+    drop_na()
+}
+
+friedman_tbl <- map(levels(long$item), \(it) {
+  w <- wide_item(it)
+  m <- as.matrix(w[, -1])
+  ft <- friedman.test(m)
+  tibble(item = it, n = nrow(m), chi2 = unname(ft$statistic), df = unname(ft$parameter),
+         p = ft$p.value, kendall_W = unname(ft$statistic) / (nrow(m) * (ncol(m) - 1)))
+}) |> list_rbind()
+
+friedman_tbl |> kable(digits = c(0, 0, 2, 0, 3, 3),
+                      col.names = c("Item", "n", "χ²", "df", "p", "Kendall's W"))
+```
+
+### Pairwise comparisons
+
+Wilcoxon signed-rank tests. *r* = Z/√n
+(matched-pairs effect size); *d~z~* = mean difference / SD of differences.
+"A > B" / "A < B" counts the participants who rated A higher / lower than B.
+
+```{r}
+#| label: tbl-pairwise
+
+pairwise_tbl <- map(levels(long$item), \(it) {
+  w <- wide_item(it)
+  prs <- combn(levels(long$advice), 2, simplify = FALSE)
+  map(prs, \(pr) {
+    a <- w[[pr[1]]]; b <- w[[pr[2]]]; dif <- a - b
+    wt <- suppressWarnings(wilcox.test(a, b, paired = TRUE, exact = FALSE, correct = TRUE))
+    z  <- if (all(dif == 0)) 0 else qnorm(wt$p.value / 2) * -sign(median(dif[dif != 0]))
+    tibble(item = it, comparison = paste(pr[1], "vs", pr[2]), n = length(dif),
+           mean_diff = mean(dif),
+           a_higher = sum(dif > 0), b_higher = sum(dif < 0), ties = sum(dif == 0),
+           p = if (all(dif == 0)) 1 else wt$p.value,
+           r = z / sqrt(length(dif)),
+           dz = if (sd(dif) > 0) mean(dif) / sd(dif) else 0)
+  }) |> list_rbind()
+}) |> list_rbind() |>
+  group_by(item) |> mutate(p_holm = p.adjust(p, "holm")) |> ungroup() |>
+  relocate(p_holm, .after = p)
+
+pairwise_tbl |>
+  kable(digits = c(0, 0, 0, 2, 0, 0, 0, 3, 3, 2, 2),
+        col.names = c("Item", "Comparison", "n", "Mean diff (A−B)", "A > B", "A < B",
+                      "Ties", "p", "p (Holm)", "r", "dz"))
+```
+
+### Linear mixed model (robustness)
+
+`score ~ advice * item + (1 | participant)`; pairwise contrasts of advice within
+each item via `emmeans` (adjusted).
+
+```{r}
+#| label: lmm
+
+lmm <- lmer(score ~ advice * item + (1 | id), data = long)
+anova(lmm) |> as.data.frame() |> kable(digits = 3)
+
+emm <- emmeans(lmm, ~ advice | item)
+pairs(emm, adjust = "tukey") |> as.data.frame() |>
+  kable(digits = 3)
+```
+
+### Ordinal mixed models (robustness)
+
+Cumulative-link mixed models per item: `score ~ advice + (1 | participant)`.
+Coefficients are log-odds of a higher rating relative to the reference advice
+(`r levels(long$advice)[1]`). With small samples or little variation these
+models may not converge; failures are reported instead of stopping the render.
+
+```{r}
+#| label: clmm
+
+clmm_tbl <- map(levels(long$item), \(it) {
+  dd <- long |> filter(item == it) |> mutate(y = factor(score, levels = 1:5, ordered = TRUE))
+  fit <- tryCatch(ordinal::clmm(y ~ advice + (1 | id), data = dd, nAGQ = 5),
+                  error = function(e) e)
+  if (inherits(fit, "error")) {
+    return(tibble(item = it, term = NA, estimate = NA, se = NA, p = NA,
+                  note = paste("Model failed:", conditionMessage(fit))))
+  }
+  co <- summary(fit)$coefficients
+  co <- co[str_detect(rownames(co), "^advice"), , drop = FALSE]
+  tibble(item = it, term = str_remove(rownames(co), "^advice"),
+         estimate = co[, 1], se = co[, 2], p = co[, 4],
+         OR = exp(co[, 1]), note = "")
+}) |> list_rbind()
+
+clmm_tbl |> kable(digits = 3)
+```
+
+## Participant-level patterns
+
+The three responses give the same recommendation and nearly identical
+justifications, so an important pretest question is whether participants
+**differentiate** between them at all.
+
+```{r}
+#| label: tbl-differentiation
+
+diff_tbl <- long |>
+  group_by(item, id) |>
+  summarise(identical = n_distinct(score) == 1, range = max(score) - min(score),
+            .groups = "drop") |>
+  group_by(item) |>
+  summarise(`% identical ratings across all versions` = 100 * mean(identical),
+            `Mean within-person range` = mean(range),
+            .groups = "drop")
+
+all_same <- long |> group_by(id) |>
+  summarise(same = all(tapply(score, item, \(x) n_distinct(x) == 1))) |>
+  summarise(pct = 100 * mean(same)) |> pull(pct)
+
+diff_tbl |> kable(digits = 1, col.names = c("Item", "% identical ratings across all versions",
+                                           "Mean within-person range (points)"))
+```
+
+`r round(all_same, 1)`% of participants gave exactly the same ratings to all
+versions on **every** item.
+
+```{r}
+#| label: tbl-preferred
+#| tbl-cap: "Which version does each participant rate highest? Based on the mean of the three items; ties are shown separately."
+
+pref <- long |>
+  group_by(id, advice) |> summarise(m = mean(score), .groups = "drop") |>
+  group_by(id) |>
+  summarise(best = if (sum(m == max(m)) > 1) "Tie" else as.character(advice[which.max(m)]),
+            .groups = "drop") |>
+  count(best) |> mutate(pct = 100 * n / sum(n)) |>
+  arrange(desc(n))
+pref |> kable(digits = 1, col.names = c("Highest-rated version", "n", "%"))
+```
+
+## Relationships between the items
+
+Spearman correlations between the three items, computed separately for each
+advice version. If "standard matters" and "reasoning makes sense" correlate
+strongly with "inclined to revise", the first two may act as mechanisms for the
+persuasiveness of the advice.
+
+```{r}
+#| label: fig-cor
+#| fig-height: 3.5
+#| fig-width: 9
+
+cors <- long |>
+  select(id, advice, item, score) |>
+  pivot_wider(names_from = item, values_from = score) |>
+  group_by(advice) |>
+  group_modify(\(df, key) {
+    m <- suppressWarnings(cor(df[, levels(long$item)], method = "spearman", use = "pairwise"))
+    as_tibble(m, rownames = "item1") |> pivot_longer(-item1, names_to = "item2", values_to = "rho")
+  }) |> ungroup() |>
+  mutate(item1 = factor(item1, levels(long$item)), item2 = factor(item2, rev(levels(long$item))))
+
+ggplot(cors, aes(item1, item2, fill = rho)) +
+  geom_tile(colour = "white", linewidth = 1) +
+  geom_text(aes(label = ifelse(is.na(rho), "–", sprintf("%.2f", rho))), size = 3.5) +
+  facet_wrap(~ advice) +
+  scale_fill_gradient2(low = "#c73a39", mid = "#f0efec", high = "#2a78d6",
+                       limits = c(-1, 1), na.value = "grey95", name = "Spearman ρ") +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), panel.grid = element_blank())
+```
+
+## Order effects
+
+The advice blocks were presented in random order (Qualtrics block randomiser
+`FL_17`). The order is only in the data if *"Export randomized viewing order"* is
+ticked when downloading from Qualtrics (a column like `FL_17_DO`). If present,
+this section tests whether the position (1st, 2nd, 3rd) affected the ratings.
+
+```{r}
+#| label: order
+
+do_col <- str_subset(names(d_clean), "^FL_\\d+_DO$")
+do_col <- do_col[map_lgl(do_col, \(cc) any(str_detect(d_clean[[cc]], paste(names(block_to_advice), collapse = "|")), na.rm = TRUE))]
+
+if (length(do_col) == 0) {
+  cat("No display-order column found in this export -> order effects cannot be tested.\n",
+      "Tip: in Qualtrics > Data & Analysis > Export, tick 'Export randomized viewing order'.\n")
+} else {
+  ord <- d_clean |>
+    select(ResponseId, order = all_of(do_col[1])) |>
+    mutate(order = str_split(order, "\\|")) |>
+    unnest_longer(order, indices_to = "position") |>
+    mutate(advice_code = block_to_advice[str_trim(order)]) |>
+    filter(!is.na(advice_code))
+  long_ord <- long |> left_join(ord |> select(ResponseId, advice_code, position),
+                                by = c("ResponseId", "advice_code"))
+  long_ord |> group_by(item, position) |>
+    summarise(mean = mean(score), sd = sd(score), n = n(), .groups = "drop") |>
+    kable(digits = 2) |> print()
+  lmm_ord <- lmer(score ~ advice * item + factor(position) + (1 | id), data = long_ord)
+  anova(lmm_ord) |> as.data.frame() |> kable(digits = 3) |> print()
+}
+```
+
+## Planning the main study
+
+Observed paired effect sizes (*d~z~*) from the pretest and the number of
+participants a **within-subject** paired *t*-test would need for 80% power
+(α = .05, two-sided) to detect them. Pretest effect sizes are imprecise with small
+samples; treat these as rough guidance only.
+
+```{r}
+#| label: tbl-power
+
+power_tbl <- pairwise_tbl |>
+  select(item, comparison, dz) |>
+  mutate(N_needed_80 = map_dbl(dz, \(e) {
+    if (is.na(e) || abs(e) < 0.02) return(NA_real_)
+    ceiling(power.t.test(delta = abs(e), sd = 1, sig.level = .05, power = .80,
+                         type = "paired")$n)
+  }))
+power_tbl |> kable(digits = 2, col.names = c("Item", "Comparison", "Observed dz", "N for 80% power"))
+```
+
+## Summary of key numbers
+
+```{r}
+#| label: summary
+
+best <- desc |> group_by(item) |> slice_max(mean, n = 1, with_ties = TRUE) |>
+  summarise(top = paste(advice, collapse = " / "), mean = first(mean), .groups = "drop")
+
+tibble(
+  Item = friedman_tbl$item,
+  `Highest mean` = best$top[match(friedman_tbl$item, best$item)],
+  `Friedman p` = friedman_tbl$p,
+  `Kendall's W` = friedman_tbl$kendall_W,
+  `Significant pairs (Holm p < .05)` = map_chr(friedman_tbl$item, \(it) {
+    s <- pairwise_tbl |> filter(item == it, p_holm < .05)
+    if (nrow(s) == 0) "none" else paste(s$comparison, collapse = "; ")
+  })
+) |> kable(digits = 3)
+```
+
+```{r}
+#| label: save
+#| include: false
+
+if (params$save_outputs) {
+  write_csv(d_clean |> select(-any_of(c("IPAddress", "LocationLatitude", "LocationLongitude"))),
+            "output/pretest_clean_wide.csv")
+  write_csv(long |> select(ResponseId, advice, item, response, score),
+            "output/pretest_clean_long.csv")
+  write_csv(desc, "output/pretest_descriptives.csv")
+  write_csv(friedman_tbl, "output/pretest_friedman.csv")
+  write_csv(pairwise_tbl, "output/pretest_pairwise.csv")
+}
+```
+
+::: {.callout-note}
+## Notes
+
+- Cleaned files are written to `output/` next to this document (IP addresses and
+  locations are removed). The raw Qualtrics exports are never modified.
+- For the order-effects analysis, export the data with *"Export randomized viewing order"* ticked.
+- If `attempts_take` / `attempts_give` should record comprehension attempts, check the
+  embedded-data setup in Qualtrics – they are currently exported empty.
+:::
+
+```{r}
+#| label: session
+#| code-fold: true
+#| results: hold
+
+sessionInfo()
+```
